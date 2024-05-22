@@ -1,0 +1,242 @@
+# Train the model with mutiple gpus
+# Topology graph is duplicated across all the GPUs
+# Feature data is horizontally partitioned across all the GPUs
+# Each GPU has a feature size with: [#Nodes, Origin Feature Size / Total GPUs]
+# Before every minibatch, feature is fetched from other GPUs for aggregation
+# Model is duplicated across all the GPUs
+# Use Pytorch DDP to synchronize model parameters / gradients across GPUs
+# Use NCCL as the backend for communication
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
+import dgl
+import torch
+from ogb.nodeproppred import DglNodePropPredDataset
+from models.sage import Sage, create_sage_p3
+from models.gat import Gat, create_gat_p3
+from p3_trainer import P3Trainer
+from base_trainer import BaseTrainer
+import gc
+from utils import *
+from torch.distributed import init_process_group, destroy_process_group, barrier
+import os
+import torch.multiprocessing as mp
+from dgl.utils import pin_memory_inplace
+
+def get_dgl_dataloader(config: RunConfig,
+                         sampler: dgl.dataloading.NeighborSampler, 
+                         graph: dgl.DGLGraph, 
+                         train_nids: torch.Tensor,
+                         use_dpp=True,
+                         use_uva=False) -> dgl.dataloading.dataloader.DataLoader:
+    device = torch.device(f"cuda:{config.rank}")
+    graph = graph.to(device)
+    dataloader = dgl.dataloading.DataLoader(
+        # The following arguments are specific to DGL's DataLoader.
+        graph=graph,              # The graph
+        indices=train_nids.to(device),         # The node IDs to iterate over in minibatches
+        graph_sampler=sampler,            # The neighbor sampler
+        device=device,      # Put the sampled MFGs on CPU or GPU
+        use_ddp=use_dpp, # enable ddp if using mutiple gpus
+        # The following arguments are inherited from PyTorch DataLoader.
+        batch_size=config.batch_size,    # Batch size
+        shuffle=True,       # Whether to shuffle the nodes for every epoch
+        drop_last=True,    # Whether to drop the last incomplete batch
+        num_workers=0,       # Number of sampler processes
+        use_uva=use_uva
+    )
+    return dataloader
+
+def create_model(config: RunConfig):
+    if config.model == 'sage':
+        return Sage(in_feats=config.global_in_feats, hid_feats=config.hid_feats, num_layers=len(config.fanouts),out_feats=config.num_classes).to(config.rank)
+    elif config.model == 'gat':
+        return Gat(in_feats=config.global_in_feats, hid_feats=config.hid_feats, num_layers=len(config.fanouts),out_feats=config.num_classes,num_heads=config.num_heads).to(config.rank)
+
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "63500"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+def base_train(rank:int, 
+         world_size:int, 
+         config: RunConfig,
+         loc_feats: list[torch.Tensor], # CPU feature
+         sampler: dgl.dataloading.NeighborSampler, 
+         node_labels: torch.Tensor, 
+         idx_split):
+    ddp_setup(rank, world_size)
+    graph = dgl.hetero_from_shared_memory("dglgraph").formats("csc")
+    node_labels = node_labels.to(rank)
+    train_nids = idx_split['train']
+    valid_nids = idx_split['valid']
+    loc_feat = loc_feats[rank].to(rank)
+        
+    config.rank = rank
+    config.world_size = world_size
+    config.mode = 2
+
+    config.set_logpath()
+    train_dataloader = get_dgl_dataloader(config, sampler, graph, train_nids, use_dpp=True)
+    val_dataloader = get_dgl_dataloader(config, sampler, graph, valid_nids, use_dpp=True)
+    model = create_model(config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = BaseTrainer(config, model, train_dataloader, val_dataloader, loc_feat, node_labels, optimizer, torch.int32)
+    trainer.train()
+    destroy_process_group()
+
+def visualize_feature_splits(local_feats, save_path="feature_splits.png"):
+    num_gpus = len(local_feats)
+    num_nodes = local_feats[0].shape[0]
+    
+    # Concatenate all local features to show the complete feature space
+    combined_feats = np.hstack([local_feat.cpu().numpy() for local_feat in local_feats])
+
+    plt.figure(figsize=(20, 5))
+    plt.imshow(combined_feats[:100, :], aspect='auto', cmap='viridis')  # Display only the first 100 nodes' features
+    plt.colorbar()
+    plt.title('Feature Partitions Across GPUs')
+    plt.xlabel('Feature Dimension')
+    plt.ylabel('Node Index')
+    
+    # Add vertical lines to separate GPU partitions
+    for i in range(num_gpus):
+        if i > 0:
+            plt.axvline(x=i * local_feats[0].shape[1], color='red', linestyle='--')
+        midpoint = (i * local_feats[0].shape[1] + (i + 1) * local_feats[0].shape[1]) / 2
+        plt.text(midpoint, -10, f'GPU {i}', ha='center', va='center', color='red', fontsize=12, fontweight='bold')
+    
+    plt.savefig(save_path)
+    plt.close()
+
+def get_graph_statistics(graph, node_labels, features):
+    num_nodes = graph.number_of_nodes()
+    num_edges = graph.number_of_edges()
+    num_classes = len(torch.unique(node_labels))
+    num_features = features.shape[1]
+
+    stats = {
+        "Number of Nodes": num_nodes,
+        "Number of Edges": num_edges,
+        "Number of Classes": num_classes,
+        "Number of Features": num_features
+    }
+
+    return stats
+
+def visualize_degree_distribution(graph, save_path="degree_distribution.png"):
+    degrees = graph.out_degrees().numpy()
+    plt.figure(figsize=(10, 6))
+    sns.histplot(degrees, bins=50, kde=True)
+    plt.yscale('log')
+    plt.xlabel("Degree")
+    plt.ylabel("Frequency (log scale)")
+    plt.title("Node Degree Distribution")
+    plt.savefig(save_path)
+    plt.close()
+
+def display_graph_statistics(stats, save_path="graph_statistics.csv"):
+    df = pd.DataFrame(stats.items(), columns=["Statistic", "Value"])
+    df.to_csv(save_path, index=False)
+    print(df)
+
+def display_feature_examples(features, num_examples=5, save_path="feature_examples.csv"):
+    sample_indices = np.random.choice(features.shape[0], num_examples, replace=False)
+    sample_features = features[sample_indices]
+    df = pd.DataFrame(sample_features.numpy())
+    df.to_csv(save_path, index=False)
+    print(df)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='simple base gnn')
+    parser.add_argument('--total_epochs', default=6, type=int, help='Total epochs to train the model')
+    parser.add_argument('--save_every', default=150, type=int, help='How often to save a snapshot')
+    parser.add_argument('--hid_feats', default=256, type=int, help='Size of a hidden feature')
+    parser.add_argument('--batch_size', default=1024, type=int, help='Input batch size on each device (default: 1024)')
+    parser.add_argument('--nprocs', default=4, type=int, help='Number of GPUs / processes')
+    parser.add_argument('--model', default="gat", type=str, help='Model type: sage or gat', choices=['sage', 'gat'])
+    parser.add_argument('--num_heads', default=4, type=int, help='Number of heads for GAT model')
+    parser.add_argument('--graph_name', default="ogbn-arxiv", type=str, help="Input graph name any of ['ogbn-arxiv', 'ogbn-products', 'ogbn-papers100M']", choices=['ogbn-arxiv', 'ogbn-products', 'ogbn-papers100M'])
+    args = parser.parse_args()
+    project_dir = os.path.dirname(os.path.realpath(__file__))
+    log_dir = os.path.join(project_dir, "logs")
+    data_dir = os.path.join(project_dir, "dataset")
+    
+    config = RunConfig()
+    world_size = min(args.nprocs, torch.cuda.device_count())
+    print(f"using {world_size} GPUs")
+    print("start loading data")
+    
+    load_start = time.time()
+    dataset = DglNodePropPredDataset(args.graph_name, root=data_dir)
+    load_end = time.time()
+    print(f"finish loading in {round(load_end - load_start, 1)}s")
+    
+    graph: dgl.DGLGraph = dataset[0][0]
+    graph = dgl.add_self_loop(graph)
+    node_labels: torch.Tensor = dataset[0][1]
+    node_labels = node_labels.flatten().clone()
+    torch.nan_to_num_(node_labels, nan=0.1)
+    node_labels: torch.Tensor = node_labels.type(torch.int64)
+    feat: torch.Tensor = graph.dstdata.pop("feat")
+
+    # Get and display graph statistics
+    stats = get_graph_statistics(graph, node_labels, feat)
+    display_graph_statistics(stats, save_path=os.path.join(project_dir, "graph_statistics.csv"))
+
+    # Display feature examples
+    display_feature_examples(feat, num_examples=5, save_path=os.path.join(project_dir, "feature_examples.csv"))
+
+    # Visualize degree distribution
+    visualize_degree_distribution(graph, save_path=os.path.join(project_dir, "degree_distribution.png"))
+     
+    config.num_classes = dataset.num_classes
+    config.batch_size = args.batch_size
+    config.total_epoch = args.total_epochs
+    config.hid_feats = args.hid_feats
+    config.save_every = args.save_every
+    config.graph_name = args.graph_name
+    config.fanouts = [20, 20, 20]
+    config.global_in_feats = feat.shape[1]
+    config.model = args.model
+    config.num_heads = args.num_heads
+    idx_split = dataset.get_idx_split()
+    config.log_dir = log_dir
+
+    print("Global Feature Size: ", get_size_str(feat))    
+
+    graph = graph.int()
+    for key, nids in idx_split.items():
+        idx_split[key] = nids.type(torch.int32)
+    graph.create_formats_()
+    print(f"using dgl sampler, graph formats created: {graph.formats()}")
+    shared_graph = graph.shared_memory("dglgraph")
+    sampler = dgl.dataloading.NeighborSampler(config.fanouts)
+    del dataset, graph
+    gc.collect()
+    
+    # Feature data is horizontally partitioned
+    feats = [None] * world_size
+    for i in range(world_size):
+        feats[i] = get_local_feat(i, world_size, feat, padding=True).clone()
+        if i == 0:
+            config.global_in_feats = feats[i].shape[1] * world_size
+            config.local_in_feats = feats[i].shape[1]
+        assert(config.global_in_feats == feats[i].shape[1] * world_size)
+        assert(config.local_in_feats == feats[i].shape[1])
+
+    del feat
+    gc.collect()
+
+    # Visualize and save feature splits
+    visualize_feature_splits(feats, save_path=os.path.join(project_dir, "feature_splits.png"))
+
+    # P3 Data Vertical Split + Intra-Model Parallelism       
+    mp.spawn(base_train, args=(world_size, config, feats, sampler, node_labels, idx_split), nprocs=world_size, daemon=True)
