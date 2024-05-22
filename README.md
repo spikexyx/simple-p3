@@ -3,7 +3,9 @@ A simple implementation of the paper P3: Distributed Deep Graph Learning at Scal
 
 ## Prerequisites
 CUDA, Pytorch, Python: environment used in this implementation is CUDA 12.1.1, Pytorch 2.2.1, Python 3.11
+
 Install DGL: refer to dgl site https://www.dgl.ai/pages/start.html
+
 Required libraries:
 ~~~
 pip install pydantic ogb torchmetrics matplotlib seaborn  # and other libs may be required
