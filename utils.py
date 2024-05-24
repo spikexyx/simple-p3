@@ -52,13 +52,6 @@ def get_size_str(tensor: torch.Tensor) -> str:
         return f"{round(size / 1000000000.0)} GB"
     
 
-
-# This function split the feature data horizontally
-# each node's data is partitioned into 'world_size' chunks
-# return the partition corresponding to the 'rank'
-# Input args:
-# rank: [0, world_size - 1]
-# Output: feat
 def get_local_feat(rank: int, world_size:int, feat: torch.Tensor, padding=True) -> torch.Tensor:
     org_feat_width = feat.shape[1]
     if padding and org_feat_width % world_size != 0:

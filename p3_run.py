@@ -28,14 +28,13 @@ def get_dgl_dataloader(config: RunConfig,
                          use_dpp=True,
                          use_uva=False) -> dgl.dataloading.dataloader.DataLoader:
     device = torch.device(f"cuda:{config.rank}")
-    # if config.topo == 'gpu':
     graph = graph.to(device)
     dataloader = dgl.dataloading.DataLoader(
         # The following arguments are specific to DGL's DataLoader.
         graph=graph,              # The graph
         indices=train_nids.to(device),         # The node IDs to iterate over in minibatches
         graph_sampler=sampler,            # The neighbor sampler
-        device=device,      # Put the sampled MFGs on CPU or GPU
+        device=device,      # Put the sampled MFGs on GPU
         use_ddp=use_dpp, # enable ddp if using mutiple gpus
         # The following arguments are inherited from PyTorch DataLoader.
         batch_size=config.batch_size,    # Batch size
